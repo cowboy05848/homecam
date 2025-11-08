@@ -1,35 +1,175 @@
 # /home/ubuntu/homecam-api/app/routers/vpn.py
-import os, json
+import os
+import json
+import base64
+import subprocess
 from typing import Optional
+
 import redis
 from fastapi import APIRouter, HTTPException, Header
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from app.db import (
+    init_db, upsert_vpn, fetch_assigned_ips, mark_vpn_removed,
+    fetch_owner_user_id
+)
+
+# ── 초기화 ─────────────────────────────────────────────────────────────────────
+init_db()
 r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
 
-router = APIRouter(prefix="/vpn/tunnels", tags=["vpn"])
+router = APIRouter(prefix="/vpn", tags=["vpn"])
 
+SERVER_ENDPOINT = os.getenv("VPN_SERVER_ENDPOINT", "18.222.191.20:51820")
+SERVER_WG_PUBKEY_B64 = os.getenv("VPN_SERVER_PUBKEY_B64", "SERVER_WG_PUBKEY_BASE64")
+IP_NET = os.getenv("VPN_NET_PREFIX", "10.8.0.")
+IP_START = int(os.getenv("VPN_IP_START_HOST", "2"))   # 10.8.0.2부터
+IP_END = int(os.getenv("VPN_IP_END_HOST", "254"))     # 10.8.0.254까지
+
+# ── 유틸 ───────────────────────────────────────────────────────────────────────
+def _require_user(x_user_id: Optional[str]) -> int:
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="auth_required")
+    try:
+        return int(x_user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_user_header")
+
+def _verify_ed25519_b64(pubkey_b64: str, message: bytes, sig_b64: str) -> bool:
+    """Ed25519 공개키(Base64) + 서명(Base64) 검증"""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.exceptions import InvalidSignature
+    try:
+        pub_bytes = base64.b64decode(pubkey_b64)
+        pub = Ed25519PublicKey.from_public_bytes(pub_bytes)
+        sig = base64.b64decode(sig_b64)
+        pub.verify(sig, message)
+        return True
+    except (InvalidSignature, ValueError, Exception):
+        return False
+
+def _alloc_ip(used: set[str]) -> str:
+    """10.8.0.X/32 한 개 배정 (중복 방지)"""
+    used_hosts = {int(ip.split(".")[-1].split("/")[0]) for ip in used if ip.startswith(IP_NET)}
+    for host in range(IP_START, IP_END + 1):
+        cidr = f"{IP_NET}{host}/32"
+        if host not in used_hosts and cidr not in used:
+            return cidr
+    raise HTTPException(status_code=503, detail="no_available_ip")
+
+def _wgctl(*args) -> None:
+    """wg 명령 래퍼(현재는 /usr/local/bin/wgctl.sh 로 대체 가능)"""
+    cmd = ["/usr/local/bin/wgctl.sh", *args]
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception:
+        # 운영 전환 시 실제 wg set/add/remove 로 교체
+        # 실패하더라도 일단 API는 동작시키고, 필요 시 raise로 바꿔도 됨.
+        pass
+
+# ── 스키마 ────────────────────────────────────────────────────────────────────
 class BeCreateInfoBody(BaseModel):
-    device_id: str                    # "CAM-2025-0001"
-    device_pubkey: str                # Ed25519 공개키 (base64)
-    registration_token: str           # 토큰 원문
+    device_id: str = Field(min_length=3)
+    device_pubkey_b64: str  # Ed25519 공개키(Base64) — 포맷 통일
+    registration_token: str
 
-@router.post("/be_create_info")
+class CreateTunnelBody(BaseModel):
+    device_id: str
+    timestamp: str
+    registration_token: str
+    signature_b64: str       # device Ed25519 개인키로 token 원문 서명(Base64)
+    client_public_key_b64: str  # WireGuard 클라이언트 공개키(Base64)
+
+# ── 1) 터널 생성 예정 정보 저장 ────────────────────────────────────────────────
+@router.post("/tunnels/be_create_info")
 def be_create_info(body: BeCreateInfoBody, x_user_id: Optional[str] = Header(None)):
-    # 1) 등록토큰 유효성 (Redis의 reg:{token} 남은 TTL 사용)
+    user_id = _require_user(x_user_id)
+
+    # 등록 토큰 TTL 확인 (reg:{token} 존재해야 함)
     reg_key = f"reg:{body.registration_token}"
     ttl = r.ttl(reg_key)
     if ttl is None or ttl <= 0:
+        # -2: 없음, -1: TTL 미설정(무제한). 무제한은 허용하지 않음
         raise HTTPException(status_code=404, detail="register_token_not_found_or_expired")
 
-    # 2) device_id를 PK처럼 임시저장 (TTL = 등록토큰 TTL)
-    key = f"vpn:be_create_info:{body.device_id}"
+    # 의도 저장: vpn_intent:{device_id} (키 네이밍 통일)
+    intent_key = f"vpn_intent:{body.device_id}"
     payload = {
         "device_id": body.device_id,
-        "device_pubkey_b64": body.device_pubkey,
+        "device_pubkey_b64": body.device_pubkey_b64,
         "registration_token": body.registration_token,
-        "owner_user_id": int(x_user_id) if x_user_id else None
+        "owner_user_id": user_id,
     }
-    r.setex(key, ttl, json.dumps(payload))
-
+    r.setex(intent_key, ttl, json.dumps(payload))
     return {"ok": True, "device_id": body.device_id, "ttl": ttl}
+
+# ── 2) 터널 생성 ───────────────────────────────────────────────────────────────
+@router.post("/tunnels/create")
+def vpn_create(body: CreateTunnelBody, x_user_id: Optional[str] = Header(None)):
+    user_id = _require_user(x_user_id)
+
+    # 의도 로드
+    intent_key = f"vpn_intent:{body.device_id}"
+    raw = r.get(intent_key)
+    if not raw:
+        raise HTTPException(status_code=404, detail="intent_not_found_or_expired")
+
+    intent = json.loads(raw)
+    token = intent.get("registration_token")
+    device_pubkey_b64 = intent.get("device_pubkey_b64")
+    owner_user_id = int(intent.get("owner_user_id") or user_id)
+
+    # 토큰 일치 확인
+    if token != body.registration_token:
+        raise HTTPException(status_code=400, detail="token_mismatch")
+
+    # 서명 검증 (message = 토큰 원문, Base64 포맷으로 통일)
+    if not _verify_ed25519_b64(device_pubkey_b64, token.encode(), body.signature_b64):
+        raise HTTPException(status_code=400, detail="invalid_signature")
+
+    # IP 할당
+    used = fetch_assigned_ips()
+    assigned_ip = _alloc_ip(used)
+    allowed_ip = assigned_ip  # 단일 /32 정책
+
+    # WireGuard 적용(모의 호출)
+    _wgctl("add-peer", body.device_id, body.client_public_key_b64, allowed_ip)
+
+    # DB 저장(UPSERT)
+    upsert_vpn(
+        device_id=body.device_id,
+        owner_user_id=owner_user_id,
+        client_pubkey=body.client_public_key_b64,  # WG 클라 공개키(Base64)
+        assigned_ip=assigned_ip,
+        allowed_ip=allowed_ip,
+        status="registered",
+    )
+
+    # 의도 제거(1회성)
+    r.delete(intent_key)
+
+    return {
+        "device_id": body.device_id,
+        "status": "registered",
+        "tunnel": {
+            "server_vpn_pubkey": SERVER_WG_PUBKEY_B64,
+            "server_endpoint": SERVER_ENDPOINT,
+            "allowed_ips": allowed_ip,
+            "persistent_keepalive": 25,
+        },
+    }
+
+# ── 3) 터널 삭제(204) ─────────────────────────────────────────────────────────
+@router.delete("/tunnels/{device_id}", status_code=204)
+def vpn_delete_tunnel(device_id: str, x_user_id: Optional[str] = Header(None)):
+    user_id = _require_user(x_user_id)
+
+    owner = fetch_owner_user_id(device_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="not_found")
+    if owner is not None and int(owner) != int(user_id):
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    # 소프트 삭제로 상태 일원화
+    mark_vpn_removed(device_id)
+    return
