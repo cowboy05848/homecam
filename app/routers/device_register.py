@@ -187,8 +187,8 @@ def issue_registration_token(x_user_id: Optional[str] = Header(None)):
 
     token = secrets.token_urlsafe(16)  # URL-safe
     # 토큰에는 최소한 owner_user_id를 저장. (public_key/ssid는 클라이언트가 이후 등록 요청에서 사용)
-    r.setex(f"reg:{token}", 300, json.dumps({"owner_user_id": x_user_id}))
-    return {"token": token, "expires_in_seconds": 300}
+    r.setex(f"reg:{token}", 3000, json.dumps({"owner_user_id": x_user_id}))
+    return {"token": token, "expires_in_seconds": 3000}
 
 
 # ✅ 4) 기기 삭제 (string/hash 모두 지원)
