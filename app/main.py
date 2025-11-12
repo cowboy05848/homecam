@@ -1,28 +1,26 @@
 from fastapi import FastAPI
-
-# 패키지 충돌(uvicorn의 /srv/fastapi/app.py 모듈명 'app')을 피하기 위해
-# 먼저 app.* 임포트를 시도하고, 실패하면 루트 임포트로 폴백한다.
 try:
-    from app.db import init_db
-    from app.routers.device_register import router as device_register_router
-    from app.routers.streaming import router as streaming_router
     from app.routers.vpn import router as vpn_router
+    from app.routers.streaming import router as stream_router
 except ImportError:
-    from db import init_db
-    from routers.device_register import router as device_register_router
-    from routers.streaming import router as streaming_router
     from routers.vpn import router as vpn_router
+    from routers.streaming import router as stream_router
+
+from fastapi import APIRouter
 
 app = FastAPI(title="Homecam API", version="1.0.0")
 
-# DB 테이블 보장
-init_db()
-
-# 라우터 등록
-app.include_router(device_register_router)   # /devices/...
-app.include_router(streaming_router)         # /stream/...
-app.include_router(vpn_router)               # /vpn/...
-
+# / → 헬스체크
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "homecam"}
+    return {"ok": True, "service": "homecam"}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+# /api 프리픽스 아래에 라우터 묶기 (nginx location /api/ 와 맞춤)
+api = APIRouter(prefix="/api")
+api.include_router(vpn_router)      # /api/vpn/...
+api.include_router(stream_router)   # /api/stream/...
+app.include_router(api)

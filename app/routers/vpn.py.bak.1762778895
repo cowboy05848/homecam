@@ -1,0 +1,62 @@
+import os
+import json
+import base64
+import time
+from typing import Optional
+
+import redis
+from fastapi import APIRouter, HTTPException, Header
+from pydantic import BaseModel, Field
+
+from app.db import (
+    init_db, upsert_vpn, fetch_assigned_ips, mark_vpn_removed,
+    fetch_owner_user_id
+)
+
+# --- be_create_info: JWT exp -> Redis TTL 저장 (appended) ---
+@router.post("/tunnels/be_create_info")
+def be_create_info(body: BeCreateInfoBody, x_user_id: Optional[str] = Header(None)):
+    user_id = _require_user(x_user_id)
+
+    # JWT payload 파싱(우선 서명 미검증: 운영에선 REG_TOKEN_SECRET로 검증 예정)
+    try:
+        import jwt, time
+        claims = jwt.decode(body.registration_token, options={"verify_signature": False})
+    except Exception:
+        raise HTTPException(status_code=400, detail="token_invalid")
+
+    # 필수 클레임 검증 및 TTL 계산
+    exp = claims.get("exp")
+    iat = claims.get("iat")
+    typ = claims.get("typ")
+    if typ != "registration":
+        raise HTTPException(status_code=400, detail="token_typ_invalid")
+    try:
+        now = int(time.time())
+        exp = int(exp)
+        if iat is not None:
+            iat = int(iat)
+    except Exception:
+        raise HTTPException(status_code=400, detail="token_claims_invalid")
+
+    if iat is not None and iat > now + 300:
+        raise HTTPException(status_code=400, detail="token_iat_invalid")
+
+    ttl = exp - now
+    if ttl <= 0:
+        raise HTTPException(status_code=401, detail="token_expired")
+
+    # intent 저장 (exp에 맞춰 setex)
+    intent_key = f"vpn_intent:{body.device_id}"
+    payload = {
+        "device_id": body.device_id,
+        "device_pubkey_b64": body.device_pubkey_b64,
+        "registration_token": body.registration_token,
+        "owner_user_id": user_id,
+        "jti": claims.get("jti"),
+        "iss": claims.get("iss"),
+        "iat": claims.get("iat"),
+        "exp": claims.get("exp"),
+    }
+    r.setex(intent_key, ttl, json.dumps(payload))
+    return {"ok": True, "device_id": body.device_id, "ttl": ttl}
