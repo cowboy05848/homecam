@@ -1,54 +1,30 @@
-import os
-import json
-import base64
+import os, json, base64, time, socket as _sock
 from typing import Optional
-from datetime import datetime, timezone
 
 import redis
 from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel, Field
 
-from app.db import (
-    init_db, upsert_vpn, fetch_assigned_ips, mark_vpn_removed,
-    fetch_owner_user_id
-)
+# DB
+try:
+    from app.db import init_db, upsert_vpn, fetch_assigned_ips, mark_vpn_removed, fetch_owner_user_id
+except ImportError:
+    from db import init_db, upsert_vpn, fetch_assigned_ips, mark_vpn_removed, fetch_owner_user_id
 
-# --- IPC to wgdaemon (no subprocess in FastAPI) ---
-import socket as _sock
-import json as _json
-
-WG_SOCK_PATH = "/run/wgdaemon/wg.sock"
-
-def _wg_ipc(action: str, payload: dict) -> None:
-    req = {"action": action, **payload}
-    data = _json.dumps(req).encode("utf-8")
-    try:
-        with _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM) as s:
-            s.connect(WG_SOCK_PATH)
-            s.sendall(data)
-            resp_raw = s.recv(4096)
-    except Exception:
-        raise HTTPException(status_code=502, detail="wg_ipc_unreachable")
-    try:
-        resp = _json.loads(resp_raw.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=502, detail="wg_ipc_bad_json")
-    if not resp.get("ok"):
-        err = resp.get("error", "wg_ipc_failed")
-        raise HTTPException(status_code=502, detail=err)
-
-# ── 초기화 ─────────────────────────────────────────────────────────────────────
+# ── 설정/연결 ──────────────────────────────────────────────────────────────────
 init_db()
 r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
 
 router = APIRouter(prefix="/vpn", tags=["vpn"])
 
-# 서버/네트워크 기본값
-SERVER_ENDPOINT = os.getenv("VPN_SERVER_ENDPOINT", "18.222.191.20:51820")
+SERVER_ENDPOINT = os.getenv("VPN_SERVER_ENDPOINT", "3.134.103.130:51820")
 SERVER_WG_PUBKEY_B64 = os.getenv("VPN_SERVER_PUBKEY_B64", "SERVER_WG_PUBKEY_BASE64")
+WG_SOCK_PATH = os.getenv("WG_SOCK_PATH", "/run/wgdaemon/wg.sock")
+
 IP_NET = os.getenv("VPN_NET_PREFIX", "10.8.0.")
 IP_START = int(os.getenv("VPN_IP_START_HOST", "2"))
-IP_END = int(os.getenv("VPN_IP_END_HOST", "254"))
+IP_END   = int(os.getenv("VPN_IP_END_HOST", "254"))
+FALLBACK_INTENT_TTL = int(os.getenv("INTENT_TTL_DEFAULT", "3000"))  # JWT 아님/exp 없음 폴백
 
 # ── 유틸 ───────────────────────────────────────────────────────────────────────
 def _require_user(x_user_id: Optional[str]) -> int:
@@ -59,28 +35,19 @@ def _require_user(x_user_id: Optional[str]) -> int:
     except Exception:
         raise HTTPException(status_code=400, detail="invalid_user_header")
 
-def _b64u_decode(s: str) -> bytes:
-    s = (s or "").strip()
-    pad = (-len(s)) % 4
-    if pad:
-        s += "=" * pad
-    try:
-        return base64.urlsafe_b64decode(s.encode("utf-8"))
-    except Exception:
-        raise ValueError("bad_base64")
+def _b64url_decode(s: str) -> bytes:
+    sb = s.encode() if isinstance(s, str) else s
+    sb = sb.replace(b"-", b"+").replace(b"_", b"/")
+    sb = sb + b"=" * ((4 - (len(sb) % 4)) % 4)
+    return base64.b64decode(sb)
 
-def _verify_ed25519_b64(pubkey_b64u: str, message: bytes, sig_b64u: str) -> bool:
+def _verify_ed25519_b64url(pubkey_b64url: str, message: bytes, sig_b64url: str) -> bool:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from cryptography.exceptions import InvalidSignature
     try:
-        pub_bytes = _b64u_decode(pubkey_b64u)
-        if len(pub_bytes) != 32:
-            return False
-        pub = Ed25519PublicKey.from_public_bytes(pub_bytes)
-        sig = _b64u_decode(sig_b64u)
-        if len(sig) != 64:
-            return False
-        pub.verify(sig, message)
+        pub = _b64url_decode(pubkey_b64url)
+        sig = _b64url_decode(sig_b64url)
+        Ed25519PublicKey.from_public_bytes(pub).verify(sig, message)
         return True
     except (InvalidSignature, ValueError, Exception):
         return False
@@ -93,57 +60,116 @@ def _alloc_ip(used: set[str]) -> str:
             return cidr
     raise HTTPException(status_code=503, detail="no_available_ip")
 
-def _parse_ts_rfc3339(s: str) -> datetime:
-    # 허용 형식 예: "2025-11-09T18:35:10Z" 또는 소수점 포함
-    if not s or not isinstance(s, str):
-        raise ValueError("bad_timestamp")
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
+def _wg_ipc(action: str, payload: dict) -> None:
+    req = {"action": action, **payload}
+    data = json.dumps(req).encode()
     try:
-        dt = datetime.fromisoformat(s)
+        with _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM) as s:
+            s.connect(WG_SOCK_PATH)
+            s.sendall(data)
+            resp_raw = s.recv(4096)
     except Exception:
-        raise ValueError("bad_timestamp")
-    if dt.tzinfo is None:
-        raise ValueError("bad_timestamp_tz")
-    return dt.astimezone(timezone.utc)
+        raise HTTPException(status_code=502, detail="wg_ipc_unreachable")
+    try:
+        resp = json.loads(resp_raw.decode())
+    except Exception:
+        raise HTTPException(status_code=502, detail="wg_ipc_bad_json")
+    if not resp.get("ok"):
+        raise HTTPException(status_code=502, detail=resp.get("error", "wg_ipc_failed"))
+
+# JWT 파싱(있으면 exp/iat/typ 확인, 없으면 허용)
+def _parse_registration_token(token: str) -> dict:
+    """
+    - HS256 서명 JWT면 exp/iat/typ 검사
+    - 그 외(서명 없음/랜덤 스트링 등)는 구조 검증 생략하고 빈 dict 반환
+    """
+    import jwt
+    REG_TOKEN_SECRET = os.getenv("REG_TOKEN_SECRET")
+    try:
+        if REG_TOKEN_SECRET:
+            claims = jwt.decode(
+                token,
+                REG_TOKEN_SECRET,
+                algorithms=["HS256"],
+                options={"require": ["exp", "iat"]},
+                leeway=300,
+            )
+            # typ이 있으면 registration 권장
+            if claims.get("typ") and claims["typ"] != "registration":
+                raise HTTPException(status_code=400, detail="token_typ_invalid")
+            return claims
+        else:
+            # 서명 미검증 모드: 구조만 보려 시도, 실패해도 통과
+            try:
+                return jwt.decode(token, options={"verify_signature": False})
+            except Exception:
+                return {}
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="token_expired")
+    except jwt.InvalidTokenError:
+        # 진짜 JWT인데 검증 실패인 경우
+        raise HTTPException(status_code=400, detail="token_invalid")
 
 # ── 스키마 ────────────────────────────────────────────────────────────────────
 class BeCreateInfoBody(BaseModel):
     device_id: str = Field(min_length=3)
-    device_pubkey_b64: str        # Ed25519 공개키 (URL-safe Base64)
-    registration_token: str
+    device_pubkey_b64: str
+    registration_token: Optional[str] = None  # 헤더/바디 모두 지원
 
 class CreateTunnelBody(BaseModel):
     device_id: str
-    timestamp: str                # RFC3339(UTC) 권장: e.g., 2025-11-09T18:35:10Z
+    timestamp: str
     registration_token: str
-    signature_b64: str            # Ed25519 개인키로 "device_id|timestamp|token" 서명 (URL-safe Base64)
-    client_pubkey_b64: str        # WireGuard 클라이언트 공개키 (URL-safe Base64)
+    signature_b64: str           # Ed25519 서명(URL-safe b64)
+    client_pubkey_b64: str       # WireGuard 공개키(URL-safe b64)
 
-# ── 1) 터널 생성 예정 정보 저장 ────────────────────────────────────────────────
+# ── 1) 터널 생성 예정 정보 저장 ───────────────────────────────────────────────
 @router.post("/tunnels/be_create_info")
-def be_create_info(body: BeCreateInfoBody, x_user_id: Optional[str] = Header(None)):
+def be_create_info(
+    body: BeCreateInfoBody,
+    x_user_id: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
     user_id = _require_user(x_user_id)
 
-    reg_key = f"reg:{body.registration_token}"
-    ttl = r.ttl(reg_key)
-    if ttl is None or ttl <= 0:
-        raise HTTPException(status_code=404, detail="register_token_not_found_or_expired")
+    # 토큰 추출: Authorization > body
+    token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    elif body.registration_token:
+        token = body.registration_token
+    if not token:
+        raise HTTPException(status_code=400, detail="registration_token_required")
 
-    # 공개키 형식 점검
+    # JWT면 exp 사용, 아니면 폴백 TTL
+    claims = {}
     try:
-        if len(_b64u_decode(body.device_pubkey_b64)) != 32:
-            raise ValueError()
-    except Exception:
-        raise HTTPException(status_code=400, detail="bad_device_pubkey")
+        claims = _parse_registration_token(token)
+    except HTTPException as e:
+        # JWT가 아닌 랜덤 토큰 환경도 있을 수 있으므로 token_invalid만 특별히 허용하지 않고 그대로 올림
+        if e.detail == "token_invalid":
+            raise
+        else:
+            raise
 
-    # 의도 저장
+    now = int(time.time())
+    if "exp" in claims:
+        ttl = int(claims["exp"]) - now
+        if ttl <= 0:
+            raise HTTPException(status_code=401, detail="token_expired")
+    else:
+        ttl = FALLBACK_INTENT_TTL
+
     intent_key = f"vpn_intent:{body.device_id}"
     payload = {
         "device_id": body.device_id,
         "device_pubkey_b64": body.device_pubkey_b64,
-        "registration_token": body.registration_token,
+        "registration_token": token,
         "owner_user_id": user_id,
+        "jti": claims.get("jti"),
+        "iss": claims.get("iss"),
+        "iat": claims.get("iat"),
+        "exp": claims.get("exp"),
     }
     r.setex(intent_key, ttl, json.dumps(payload))
     return {"ok": True, "device_id": body.device_id, "ttl": ttl}
@@ -153,58 +179,45 @@ def be_create_info(body: BeCreateInfoBody, x_user_id: Optional[str] = Header(Non
 def vpn_create(body: CreateTunnelBody, x_user_id: Optional[str] = Header(None)):
     user_id = _require_user(x_user_id)
 
-    # 2-1) 의도 로드
     intent_key = f"vpn_intent:{body.device_id}"
     raw = r.get(intent_key)
     if not raw:
         raise HTTPException(status_code=404, detail="intent_not_found_or_expired")
+
     intent = json.loads(raw)
     token = intent.get("registration_token")
     device_pubkey_b64 = intent.get("device_pubkey_b64")
     owner_user_id = int(intent.get("owner_user_id") or user_id)
 
-    # 2-2) 토큰 존재/재사용 차단 (SETNX used:token)
+    # 토큰 일치 확인
     if token != body.registration_token:
         raise HTTPException(status_code=400, detail="token_mismatch")
-    reg_key = f"reg:{token}"
-    if not r.exists(reg_key):
-        # 토큰이 없거나 만료되었음
-        raise HTTPException(status_code=404, detail="register_token_not_found_or_expired")
-    # 재사용 차단(최초 1회 성공만 허용)
-    if not r.setnx(f"used:{token}", 1):
-        raise HTTPException(status_code=409, detail="token_reused")
-    r.expire(f"used:{token}", 600)  # 사용 흔적 10분 유지
-    r.delete(reg_key)               # 원 토큰 제거(단일 사용 보장)
 
-    # 2-3) timestamp 신선도 검증(±5분)
+    # JWT인 경우 만료 다시 체크(서버시간 드리프트 대비)
     try:
-        ts = _parse_ts_rfc3339(body.timestamp)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="bad_timestamp")
-    now = datetime.now(timezone.utc)
-    skew = abs((now - ts).total_seconds())
-    if skew > 300:
-        raise HTTPException(status_code=400, detail="timestamp_out_of_range")
+        _ = _parse_registration_token(body.registration_token)
+    except HTTPException as e:
+        if e.detail in ("token_expired", "token_invalid"):
+            raise
 
-    # 서명 검증 (message = device_id|timestamp|token)
+    # 서명 검증: device_id|timestamp|registration_token
     msg = f"{body.device_id}|{body.timestamp}|{body.registration_token}".encode()
-    if not _verify_ed25519_b64(device_pubkey_b64, msg, body.signature_b64):
+    if not _verify_ed25519_b64url(device_pubkey_b64, msg, body.signature_b64):
         raise HTTPException(status_code=400, detail="invalid_signature")
 
-
-    # 2-5) IP 할당
+    # IP 할당
     used = fetch_assigned_ips()
     assigned_ip = _alloc_ip(used)
     allowed_ip = assigned_ip
 
-    # 2-6) WireGuard 적용(IPC)
+    # wgdaemon IPC 호출
     _wg_ipc("add_peer", {
         "device_id": body.device_id,
         "client_pubkey_b64": body.client_pubkey_b64,
         "ip_cidr": allowed_ip
     })
 
-    # 2-7) DB 저장 & intent 1회성 제거
+    # DB upsert
     upsert_vpn(
         device_id=body.device_id,
         owner_user_id=owner_user_id,
@@ -213,6 +226,8 @@ def vpn_create(body: CreateTunnelBody, x_user_id: Optional[str] = Header(None)):
         allowed_ip=allowed_ip,
         status="registered",
     )
+
+    # intent 사용 후 삭제
     r.delete(intent_key)
 
     return {
@@ -235,6 +250,7 @@ def vpn_delete_tunnel(device_id: str, x_user_id: Optional[str] = Header(None)):
         raise HTTPException(status_code=404, detail="not_found")
     if int(owner) != int(user_id):
         raise HTTPException(status_code=403, detail="forbidden")
+
     _wg_ipc("remove_peer", {"device_id": device_id})
     mark_vpn_removed(device_id)
     return
