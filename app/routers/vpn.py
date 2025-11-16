@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 try:
     from app.db import init_db, upsert_vpn, fetch_assigned_ips, mark_vpn_removed, fetch_owner_user_id
 except ImportError:
-    from db import init_db, upsert_vpn, fetch_assigned_ips, mark_vpn_removed, fetch_owner_user_id
+    from app.db import init_db, upsert_vpn, fetch_assigned_ips, mark_vpn_removed, fetch_owner_user_id
 
 # ── 설정/연결 ──────────────────────────────────────────────────────────────────
 init_db()
