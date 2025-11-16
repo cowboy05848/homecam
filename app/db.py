@@ -1,6 +1,6 @@
 import os
 from sqlalchemy import create_engine, text
-
+#코드업로드 체크 11.16
 DB_URL = os.getenv("DB_URL")
 if not DB_URL:
     DB_URL = "mysql+pymysql://homecam:homecam1234%40@localhost/homecam?charset=utf8mb4"

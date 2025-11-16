@@ -3,7 +3,7 @@ from typing import Optional
 import redis
 from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel, Field
-
+#코드체크 11/16
 try:
     from app.db import fetch_vpn_by_device
 except ImportError:

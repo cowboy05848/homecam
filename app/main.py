@@ -1,7 +1,7 @@
 from fastapi import FastAPI, APIRouter
 from app.routers.vpn import router as vpn_router
 from app.routers.streaming import router as stream_router
-
+#코드업로드 체크 11/16
 # FastAPI 앱 초기화
 app = FastAPI(title="Homecam API", version="1.0.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
 
