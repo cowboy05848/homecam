@@ -1,6 +1,7 @@
 from fastapi import FastAPI, APIRouter
 from app.routers.vpn import router as vpn_router
-from app.routers.streaming import router as stream_router
+from app.routers.streaming import router as stream_router, event_router
+
 #코드업로드 체크 11/16
 # FastAPI 앱 초기화
 app = FastAPI(title="Homecam API", version="1.0.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
@@ -23,6 +24,9 @@ api.include_router(vpn_router)
 
 # /api/stream/... 엔드포인트 추가
 api.include_router(stream_router)
+
+# /api/event/... 엔드포인트 추가
+api.include_router(event_router)
 
 # FastAPI 앱에 /api 전체 라우터 등록
 app.include_router(api)

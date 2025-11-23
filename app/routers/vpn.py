@@ -113,15 +113,14 @@ def _parse_registration_token(token: str) -> dict:
 # ── 스키마 ────────────────────────────────────────────────────────────────────
 class BeCreateInfoBody(BaseModel):
     device_id: str = Field(min_length=3)
-    device_pubkey_b64: str
+    device_pubkey: str          # ← 이름 변경
     registration_token: Optional[str] = None  # 헤더/바디 모두 지원
 
 class CreateTunnelBody(BaseModel):
     device_id: str
-    timestamp: str
-    registration_token: str
-    signature_b64: str           # Ed25519 서명(URL-safe b64)
-    client_pubkey_b64: str       # WireGuard 공개키(URL-safe b64)
+    registration_token: str                # 토큰 원문
+    signature: str                         # Ed25519 서명(base64, 토큰 원문 기준)
+    client_public_key: str                 # WireGuard 공개키(base64, X25519)
 
 # ── 1) 터널 생성 예정 정보 저장 ───────────────────────────────────────────────
 @router.post("/tunnels/be_create_info")
@@ -163,7 +162,7 @@ def be_create_info(
     intent_key = f"vpn_intent:{body.device_id}"
     payload = {
         "device_id": body.device_id,
-        "device_pubkey_b64": body.device_pubkey_b64,
+        "device_pubkey_b64": body.device_pubkey,  # ← 여기 body.device_pubkey 로 변경
         "registration_token": token,
         "owner_user_id": user_id,
         "jti": claims.get("jti"),
@@ -200,9 +199,9 @@ def vpn_create(body: CreateTunnelBody, x_user_id: Optional[str] = Header(None)):
         if e.detail in ("token_expired", "token_invalid"):
             raise
 
-    # 서명 검증: device_id|timestamp|registration_token
-    msg = f"{body.device_id}|{body.timestamp}|{body.registration_token}".encode()
-    if not _verify_ed25519_b64url(device_pubkey_b64, msg, body.signature_b64):
+    # 서명 검증: registration_token(토큰 원문)만 서명 대상으로 사용
+    msg = body.registration_token.encode()
+    if not _verify_ed25519_b64url(device_pubkey_b64, msg, body.signature):
         raise HTTPException(status_code=400, detail="invalid_signature")
 
     # IP 할당
@@ -212,20 +211,21 @@ def vpn_create(body: CreateTunnelBody, x_user_id: Optional[str] = Header(None)):
 
     # wgdaemon IPC 호출
     _wg_ipc("add_peer", {
-        "device_id": body.device_id,
-        "client_pubkey_b64": body.client_pubkey_b64,
-        "ip_cidr": allowed_ip
+    "device_id": body.device_id,
+    "client_pubkey_b64": body.client_public_key,   # 필드 이름 변경 반영
+    "ip_cidr": allowed_ip
     })
 
-    # DB upsert
+# DB upsert
     upsert_vpn(
-        device_id=body.device_id,
-        owner_user_id=owner_user_id,
-        client_pubkey=body.client_pubkey_b64,
-        assigned_ip=assigned_ip,
-        allowed_ip=allowed_ip,
-        status="registered",
+    device_id=body.device_id,
+    owner_user_id=owner_user_id,
+    client_pubkey=body.client_public_key,          # 여기서도 변경
+    assigned_ip=assigned_ip,
+    allowed_ip=allowed_ip,
+    status="registered",
     )
+
 
     # intent 사용 후 삭제
     r.delete(intent_key)

@@ -1,10 +1,11 @@
 import os
 import json
 from typing import Optional
+from datetime import datetime
 
 import redis
 import httpx
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Request
 from pydantic import BaseModel, Field
 
 # DB
@@ -19,14 +20,25 @@ r = redis.Redis.from_url(
     decode_responses=True,
 )
 
+# 스트리밍 관련 라우터
 router = APIRouter(prefix="/stream", tags=["stream"])
+
+# 모션 이벤트 / 알림 관련 라우터
+event_router = APIRouter(prefix="/event", tags=["event"])
 
 # MediaMTX SDP 교환용 URL
 # 기본값: http://127.0.0.1:8889/whip
 # 우리는 .env에 MEDIAMTX_SDP_URL=http://127.0.0.1:8889/mystream/whip 로 넣어둠
+# 모션 이벤트를 API 서버로 전달하는 내부 API URL
+# (실제 API 서버 주소에 맞게 .env 또는 여기 기본값을 조정하면 됨)
 MEDIAMTX_SDP_URL = os.getenv(
     "MEDIAMTX_SDP_URL",
     "http://127.0.0.1:8889/whip",
+)
+
+MOTION_PUSH_API_URL = os.getenv(
+    "MOTION_PUSH_API_URL",
+    "http://127.0.0.1:8000/api/push/motion",  # 예시 URL
 )
 
 # ── 스키마 ───────────────────────────────────────────────────────────────────
@@ -42,12 +54,9 @@ class StreamStartResp(BaseModel):
     sdp_answer: str
 
 
-class MotionEventBody(BaseModel):
-    device_id: str = Field(min_length=3)
-    event_type: str = Field(min_length=1, description="e.g., motion, person, sound")
-    timestamp: Optional[str] = None
-    thumbnail_url: Optional[str] = None
-    extra: Optional[dict] = None
+class MotionNotifyBody(BaseModel):
+    # 예: "2025-10-18T13:00:30Z"
+    detected_at: datetime
 
 
 # ── 공통 유틸 ────────────────────────────────────────────────────────────────
@@ -130,31 +139,51 @@ async def stream_start(body: StreamStartBody, x_user_id: Optional[str] = Header(
 # ── 2) 모션 감지 이벤트 보고 ────────────────────────────────────────────────
 
 
-@router.post("/motion-event")
-def motion_event(body: MotionEventBody, x_user_id: Optional[str] = Header(None)):
-    user_id = _require_user(x_user_id)
+@event_router.post("/notify", status_code=204)
+async def motion_notify(body: MotionNotifyBody, request: Request):
+    """
+    모션 감지 시 IPcam이 스트리밍 서버에게 호출하는 API
 
-    rec = fetch_vpn_by_device(body.device_id)
-    if not rec:
-        raise HTTPException(status_code=404, detail="device_not_found")
-    if int(rec.get("owner_user_id") or user_id) != user_id:
-        raise HTTPException(status_code=403, detail="forbidden")
+    요구사항:
+    - 초기 인증 이후, 추가 인증 없음 (VPN 터널 + HTTPS로 보호)
+    - body: { "detected_at": "2025-10-18T13:00:30Z" }
+    - 내부적으로 스트리밍 서버가 API 서버에 푸시 알림 전달 API 호출
+    - API 서버가 해당 기기/사용자 없으면 404 not_found 반환
 
-    list_key = f"motion_events:{body.device_id}"
+    동작:
+    1) VPN 터널을 통해 들어온 IPcam의 IP(요청 IP)를 확인
+    2) API 서버(MOTION_PUSH_API_URL)로 모션 이벤트 전달
+    3) API 서버 응답에 따라 404 또는 204로 응답
+    """
 
-    r.lpush(
-        list_key,
-        json.dumps(
-            {
-                "device_id": body.device_id,
-                "event_type": body.event_type,
-                "timestamp": body.timestamp,
-                "thumbnail_url": body.thumbnail_url,
-                "extra": body.extra,
-                "reported_by": user_id,
-            }
-        ),
-    )
-    r.expire(list_key, 86400)  # 1일 보관
+    # 1) 요청을 보낸 IPcam의 IP 주소 (VPN에서 할당된 10.8.0.x 등이 올 것)
+    source_ip = request.client.host
 
-    return {"ok": True}
+    # 2) API 서버에 모션 이벤트 전달
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                MOTION_PUSH_API_URL,
+                json={
+                    "source_ip": source_ip,
+                    "detected_at": body.detected_at.isoformat(),
+                },
+            )
+    except Exception:
+        # API 서버에 아예 접속이 안 되는 경우 등
+        raise HTTPException(status_code=502, detail="push_api_unreachable")
+
+    # 3) API 서버의 응답 코드에 따라 처리
+    if resp.status_code == 404:
+        # 요구사항: "해당 기기 또는 사용자 없음" → 404 not_found
+        raise HTTPException(status_code=404, detail="not_found")
+
+    if resp.status_code not in (200, 201, 204):
+        # 그 외 에러는 502로 래핑
+        raise HTTPException(
+            status_code=502,
+            detail=f"push_api_failed:{resp.status_code}",
+        )
+
+    # 성공(200/201/204)이면 이 API는 204 No Content 반환
+    return
