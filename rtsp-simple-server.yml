@@ -1,0 +1,3 @@
+rtspPort: 8554
+rtpPort: 10000
+protocols: [tcp]

@@ -152,12 +152,22 @@ def be_create_info(
             raise
 
     now = int(time.time())
-    if "exp" in claims:
-        ttl = int(claims["exp"]) - now
-        if ttl <= 0:
-            raise HTTPException(status_code=401, detail="token_expired")
-    else:
-        ttl = FALLBACK_INTENT_TTL
+print(f"[DEBUG] now={now}")
+
+if "exp" in claims:
+    exp_val = int(claims["exp"])
+    ttl = exp_val - now
+
+    print(f"[DEBUG] exp={exp_val}")
+    print(f"[DEBUG] calculated ttl (exp-now)={ttl}")
+
+    if ttl <= 0:
+        print("[DEBUG] token_expired detected")
+        raise HTTPException(status_code=401, detail="token_expired")
+else:
+    ttl = FALLBACK_INTENT_TTL
+    print(f"[DEBUG] no exp in claims → TTL={ttl}")
+
 
     intent_key = f"vpn_intent:{body.device_id}"
     payload = {
