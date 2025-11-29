@@ -168,7 +168,6 @@ else:
     ttl = FALLBACK_INTENT_TTL
     print(f"[DEBUG] no exp in claims → TTL={ttl}")
 
-
     intent_key = f"vpn_intent:{body.device_id}"
     payload = {
         "device_id": body.device_id,
