@@ -4,6 +4,7 @@ from typing import Optional
 import redis
 from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel, Field
+import binascii
 
 # DB
 try:
@@ -223,8 +224,7 @@ def vpn_create(body: CreateTunnelBody):
 
     # 서명 검증: registration_token(토큰 원문)만 서명 대상으로 사용
     msg = body.registration_token.encode()
-    if not _verify_ed25519_b64(device_pubkey_b64, msg, body.signature):
-        raise HTTPException(status_code=400, detail="invalid_signature")
+    _verify_ed25519_b64(device_pubkey_b64, msg, body.signature)
 
     # IP 할당
     used = fetch_assigned_ips()
