@@ -126,11 +126,8 @@ class CreateTunnelBody(BaseModel):
 @router.post("/tunnels/be_create_info")
 def be_create_info(
     body: BeCreateInfoBody,
-    x_user_id: Optional[str] = Header(None),
     authorization: Optional[str] = Header(None),
 ):
-    user_id = _require_user(x_user_id)
-
     # 토큰 추출: Authorization > body
     token = None
     if authorization and authorization.lower().startswith("bearer "):
@@ -173,7 +170,6 @@ def be_create_info(
         "device_id": body.device_id,
         "device_pubkey_b64": body.device_pubkey,  # ← 여기 body.device_pubkey 로 변경
         "registration_token": token,
-        "owner_user_id": user_id,
         "jti": claims.get("jti"),
         "iss": claims.get("iss"),
         "iat": claims.get("iat"),
@@ -184,8 +180,7 @@ def be_create_info(
 
 # ── 2) 터널 생성 ───────────────────────────────────────────────────────────────
 @router.post("/tunnels/create")
-def vpn_create(body: CreateTunnelBody, x_user_id: Optional[str] = Header(None)):
-    user_id = _require_user(x_user_id)
+def vpn_create(body: CreateTunnelBody):
 
     intent_key = f"vpn_intent:{body.device_id}"
     raw = r.get(intent_key)
@@ -228,7 +223,6 @@ def vpn_create(body: CreateTunnelBody, x_user_id: Optional[str] = Header(None)):
 # DB upsert
     upsert_vpn(
     device_id=body.device_id,
-    owner_user_id=owner_user_id,
     client_pubkey=body.client_public_key,          # 여기서도 변경
     assigned_ip=assigned_ip,
     allowed_ip=allowed_ip,
@@ -252,8 +246,7 @@ def vpn_create(body: CreateTunnelBody, x_user_id: Optional[str] = Header(None)):
 
 # ── 3) 터널 삭제(204) ─────────────────────────────────────────────────────────
 @router.delete("/tunnels/{device_id}", status_code=204)
-def vpn_delete_tunnel(device_id: str, x_user_id: Optional[str] = Header(None)):
-    user_id = _require_user(x_user_id)
+def vpn_delete_tunnel(device_id: str):
     owner = fetch_owner_user_id(device_id)
     if owner is None:
         raise HTTPException(status_code=404, detail="not_found")
