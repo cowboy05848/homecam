@@ -50,13 +50,25 @@ def _b64_decode(s: str) -> bytes:
 def _verify_ed25519_b64(pubkey_b64: str, message: bytes, sig_b64: str) -> bool:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from cryptography.exceptions import InvalidSignature
+
+    # Base64 decode 단계 에러 구분
     try:
         pub = base64.b64decode(pubkey_b64)
         sig = base64.b64decode(sig_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_base64")
+
+    # Ed25519 검증
+    try:
         Ed25519PublicKey.from_public_bytes(pub).verify(sig, message)
         return True
-    except (InvalidSignature, ValueError, Exception):
-        return False
+    except InvalidSignature:
+        raise HTTPException(status_code=400, detail="invalid_signature")
+    except ValueError:
+        # 키 길이 오류, 바이트 길이 틀림 등
+        raise HTTPException(status_code=400, detail="invalid_pubkey_format")
+    except Exception:
+        raise HTTPException(status_code=400, detail="verify_failed")
 
 def _alloc_ip(used: set[str]) -> str:
     used_hosts = {int(ip.split(".")[-1].split("/")[0]) for ip in used if ip.startswith(IP_NET)}
