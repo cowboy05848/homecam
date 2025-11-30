@@ -190,7 +190,6 @@ def vpn_create(body: CreateTunnelBody):
     intent = json.loads(raw)
     token = intent.get("registration_token")
     device_pubkey_b64 = intent.get("device_pubkey_b64")
-    owner_user_id = int(intent.get("owner_user_id") or user_id)
 
     # 토큰 일치 확인
     if token != body.registration_token:
