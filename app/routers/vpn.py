@@ -47,15 +47,17 @@ def _b64_decode(s: str) -> bytes:
     return base64.b64decode(s)
 
 
+
 def _verify_ed25519_b64(pubkey_b64: str, message: bytes, sig_b64: str) -> bool:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from cryptography.exceptions import InvalidSignature
 
     # Base64 decode 단계 에러 구분
     try:
-        pub = base64.b64decode(pubkey_b64)
-        sig = base64.b64decode(sig_b64)
-    except Exception:
+        pub = _b64_decode(pubkey_b64)
+        sig = _b64_decode(sig_b64)
+    except (binascii.Error, ValueError, Exception):
+        # 패딩/문자 깨진 경우 여기로
         raise HTTPException(status_code=400, detail="invalid_base64")
 
     # Ed25519 검증
@@ -65,7 +67,6 @@ def _verify_ed25519_b64(pubkey_b64: str, message: bytes, sig_b64: str) -> bool:
     except InvalidSignature:
         raise HTTPException(status_code=400, detail="invalid_signature")
     except ValueError:
-        # 키 길이 오류, 바이트 길이 틀림 등
         raise HTTPException(status_code=400, detail="invalid_pubkey_format")
     except Exception:
         raise HTTPException(status_code=400, detail="verify_failed")
