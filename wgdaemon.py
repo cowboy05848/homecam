@@ -43,23 +43,44 @@ def handle(msg: dict) -> dict:
         if not (is_valid_pubkey_b64(pub) and is_valid_cidr_32(ip_cidr)):
             return {"ok": False, "error": "invalid_pubkey_or_ip"}
         try:
-            subprocess.run(
+            # ★ stdout/stderr 캡처해서 나중에 로그로 남김
+            res = subprocess.run(
                 ["/usr/local/bin/wgctl.sh", "add-peer", device_id, pub, ip_cidr],
-                check=True
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            logging.info(
+                "add-peer ok device_id=%s ip=%s stdout=%r",
+                device_id, ip_cidr, res.stdout,
             )
             return {"ok": True}
         except subprocess.CalledProcessError as e:
-            logging.exception("add-peer failed")
+            logging.error(
+                "add-peer failed device_id=%s rc=%s stdout=%r stderr=%r",
+                device_id, e.returncode, e.stdout, e.stderr,
+            )
+            # 클라이언트에게는 코드만 넘기고, 상세 내용은 로그에서 확인
             return {"ok": False, "error": f"wgctl_failed:{e.returncode}"}
+
     else:
         try:
-            subprocess.run(
+            res = subprocess.run(
                 ["/usr/local/bin/wgctl.sh", "remove-peer", device_id],
-                check=True
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            logging.info(
+                "remove-peer ok device_id=%s stdout=%r",
+                device_id, res.stdout,
             )
             return {"ok": True}
         except subprocess.CalledProcessError as e:
-            logging.exception("remove-peer failed")
+            logging.error(
+                "remove-peer failed device_id=%s rc=%s stdout=%r stderr=%r",
+                device_id, e.returncode, e.stdout, e.stderr,
+            )
             return {"ok": False, "error": f"wgctl_failed:{e.returncode}"}
 
 def main():
