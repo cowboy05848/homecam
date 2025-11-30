@@ -35,18 +35,24 @@ def _require_user(x_user_id: Optional[str]) -> int:
     except Exception:
         raise HTTPException(status_code=400, detail="invalid_user_header")
 
-def _b64url_decode(s: str) -> bytes:
-    sb = s.encode() if isinstance(s, str) else s
-    sb = sb.replace(b"-", b"+").replace(b"_", b"/")
-    sb = sb + b"=" * ((4 - (len(sb) % 4)) % 4)
-    return base64.b64decode(sb)
+import base64
 
-def _verify_ed25519_b64url(pubkey_b64url: str, message: bytes, sig_b64url: str) -> bool:
+def _b64_decode(s: str) -> bytes:
+    if isinstance(s, str):
+        s = s.encode()
+
+    # Base64는 padding 없어도 decode 가능하게 보정할 수 있음
+    s = s + b"=" * ((4 - len(s) % 4) % 4)
+
+    return base64.b64decode(s)
+
+
+def _verify_ed25519_b64(pubkey_b64: str, message: bytes, sig_b64: str) -> bool:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from cryptography.exceptions import InvalidSignature
     try:
-        pub = _b64url_decode(pubkey_b64url)
-        sig = _b64url_decode(sig_b64url)
+        pub = _base64.b64decode(pubkey_b64)
+        sig = _base64.b64decode(sig_b64)
         Ed25519PublicKey.from_public_bytes(pub).verify(sig, message)
         return True
     except (InvalidSignature, ValueError, Exception):
@@ -204,7 +210,7 @@ def vpn_create(body: CreateTunnelBody):
 
     # 서명 검증: registration_token(토큰 원문)만 서명 대상으로 사용
     msg = body.registration_token.encode()
-    if not _verify_ed25519_b64url(device_pubkey_b64, msg, body.signature):
+    if not _verify_ed25519_b64(device_pubkey_b64, msg, body.signature):
         raise HTTPException(status_code=400, detail="invalid_signature")
 
     # IP 할당
