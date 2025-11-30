@@ -9,7 +9,7 @@ engine = create_engine(DB_URL, future=True, pool_pre_ping=True)
 
 DDL = """
 CREATE TABLE IF NOT EXISTS vpn_tunnels (
-  device_id      VARCHAR(32) PRIMARY KEY,
+  device_id      VARCHAR(64) PRIMARY KEY,
   owner_user_id  INT         NULL,
   client_pubkey  TEXT        NOT NULL,
   wg_pubkey      TEXT        NULL,
