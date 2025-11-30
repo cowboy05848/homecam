@@ -238,13 +238,14 @@ def vpn_create(body: CreateTunnelBody):
     "ip_cidr": allowed_ip
     })
 
-# DB upsert
+    # DB upsert
     upsert_vpn(
-    device_id=body.device_id,
-    client_pubkey=body.client_public_key,          # 여기서도 변경
-    assigned_ip=assigned_ip,
-    allowed_ip=allowed_ip,
-    status="registered",
+        device_id=body.device_id,
+        client_pubkey=body.client_public_key,
+        assigned_ip=assigned_ip,
+        allowed_ip=allowed_ip,
+        status="registered",
+        owner_user_id=None,
     )
 
 
