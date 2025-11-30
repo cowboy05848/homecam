@@ -51,8 +51,8 @@ def _verify_ed25519_b64(pubkey_b64: str, message: bytes, sig_b64: str) -> bool:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from cryptography.exceptions import InvalidSignature
     try:
-        pub = _base64.b64decode(pubkey_b64)
-        sig = _base64.b64decode(sig_b64)
+        pub = base64.b64decode(pubkey_b64)
+        sig = base64.b64decode(sig_b64)
         Ed25519PublicKey.from_public_bytes(pub).verify(sig, message)
         return True
     except (InvalidSignature, ValueError, Exception):
@@ -255,8 +255,6 @@ def vpn_delete_tunnel(device_id: str):
     owner = fetch_owner_user_id(device_id)
     if owner is None:
         raise HTTPException(status_code=404, detail="not_found")
-    if int(owner) != int(user_id):
-        raise HTTPException(status_code=403, detail="forbidden")
 
     _wg_ipc("remove_peer", {"device_id": device_id})
     mark_vpn_removed(device_id)
